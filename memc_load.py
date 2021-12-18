@@ -1,32 +1,17 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-import os
 import gzip
 import sys
 import glob
 import logging
-import collections
-import threading
-import time
 from optparse import OptionParser
-# brew install protobuf
-# protoc  --python_out=. ./appsinstalled.proto
-# pip install protobuf
-import appsinstalled_pb2
-# pip install python-memcached
 import memcache
-from queue import Queue
+from multiprocessing import Manager, Queue
 from typing import Dict
-from typing import Union
-from typing import Tuple
-from typing import List
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
-from utils import parse_appsinstalled
-from utils import dot_rename
-from utils import apps_group_to_dict
-from utils import AppsGroup
-from utils import prototest
+from multiprocessing import Pool
+from utils import parse_appsinstalled, dot_rename, AppsGroup, prototest
+from writer import Writer
 
 
 NORMAL_ERR_RATE = 0.01
@@ -101,33 +86,6 @@ def put_apps_in_queue(queue, dev_type, apps, fn):
         logging.exception(f'Adding in queue failed: {e}')
 
 
-def write_in_memcached(
-        client: memcache.Client,
-        queue: Queue,
-        f_stats_error: Dict[str, int],
-        f_stats_success: Dict[str, int],
-        max_retry: int,
-        time_retry: int,
-):
-
-    if queue.not_empty:
-        apps_group = queue.get()
-        queue.task_done()
-
-        out_dict = apps_group_to_dict(apps_group)
-
-        failures = []
-        for _ in range(max_retry):
-            # вроде как try не нужен, поскольку клиент ловит ошибки
-            failures = client.set_multi(out_dict)
-            if len(failures) < len(out_dict):
-                break
-            time.sleep(time_retry)
-
-        f_stats_error[apps_group.f_name] += len(failures)
-        f_stats_success[apps_group.f_name] += len(out_dict) - len(failures)
-
-
 def main(options):
     device_memc = {
         b"idfa": options.idfa,
@@ -135,43 +93,49 @@ def main(options):
         b"adid": options.adid,
         b"dvid": options.dvid,
     }
-    queue_by_device = {d: Queue(maxsize=options.queue_size) for d in device_memc.keys()}
+    manager = Manager()
+    queue_by_device = {d: manager.Queue(maxsize=options.queue_size) for d in device_memc.keys()}
 
     f_stats_error = defaultdict(int)
     f_stats_success = defaultdict(int)
 
-    w_thread_pool = ThreadPoolExecutor(len(device_memc))
+    w_workers = []
     for device, adr in device_memc.items():
-        w_thread_pool.submit(
-            write_in_memcached,
-            memcache.Client([adr], socket_timeout=options.socket_timeout),
-            queue_by_device[device],
-            f_stats_error,
-            f_stats_success,
-            options.max_retry,
-            options.time_retry,
+        w_worker = Writer(
+            memc_client=memcache.Client([adr], socket_timeout=options.socket_timeout),
+            queue=queue_by_device[device],
+            f_stats_error=f_stats_error,
+            f_stats_success=f_stats_success,
+            max_retry=options.max_retry,
+            time_retry=options.time_retry,
+            dry=options.dry
         )
+        w_worker.start()
+        w_workers.append(w_worker)
 
-    r_thread_pool = ThreadPoolExecutor(options.workers)
-    for fn in glob.iglob(options.pattern):
-        r_thread_pool.submit(
-            read_file,
-            fn,
-            queue_by_device,
-            f_stats_error,
-            f_stats_success,
-            MAX_BUFF_SIZE
-        )
+    with Pool(options.workers) as r_pool:
+        for fn in glob.iglob(options.pattern):
+            r_pool.apply(
+                read_file,
+                (
+                    fn,
+                    queue_by_device,
+                    f_stats_error,
+                    f_stats_success,
+                    MAX_BUFF_SIZE,
+                )
+            )
+    r_pool.join()
 
-    r_thread_pool.shutdown()
-    w_thread_pool.shutdown()
+    for queue in queue_by_device.values():
+        queue.put('quit')
 
 
 if __name__ == '__main__':
     op = OptionParser()
     op.add_option("-t", "--test", action="store_true", default=False)
     op.add_option("-l", "--log", action="store", default=None)
-    op.add_option("--dry", action="store_true", default=False)
+    op.add_option("--dry", action="store_true", default=True)
     op.add_option("--pattern", action="store",
                   default="/data/appsinstalled/*.tsv.gz")
     op.add_option("--idfa", action="store", default="127.0.0.1:33013")

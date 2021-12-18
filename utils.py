@@ -1,27 +1,12 @@
 import os
-import gzip
-import sys
-import glob
 import logging
 import collections
-import time
-from optparse import OptionParser
-# brew install protobuf
-# protoc  --python_out=. ./appsinstalled.proto
-# pip install protobuf
 import appsinstalled_pb2
-# pip install python-memcached
-import memcache
-from queue import Queue
 from typing import Dict
 from typing import Union
-from typing import Tuple
-from typing import List
-from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
 
 AppsInstalled = collections.namedtuple("AppsInstalled", ["dev_type", "dev_id", "lat", "lon", "apps"])
-AppsGroup = collections.namedtuple('AppsList', ['device', 'apps', "f_name"])
+AppsGroup = collections.namedtuple('AppsGroup', ['device', 'apps', "f_name"])
 
 
 def dot_rename(path):
